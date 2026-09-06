@@ -1,0 +1,61 @@
+name: Build ArkTS static SDK
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_revision:
+        description: OpenHarmony manifest branch or revision
+        required: true
+        default: master
+        type: string
+
+jobs:
+  build:
+    name: ${{ matrix.target }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: linux-x64
+            runner: '["self-hosted", "Linux", "X64"]'
+          - target: windows-x64
+            runner: '["self-hosted", "Linux", "X64"]'
+          - target: darwin-arm64
+            runner: '["self-hosted", "macOS", "ARM64"]'
+    runs-on: ${{ fromJSON(matrix.runner) }}
+    timeout-minutes: 720
+
+    steps:
+      - name: Checkout build controller
+        uses: actions/checkout@v4
+
+      - name: Install repo launcher
+        shell: bash
+        run: |
+          mkdir -p .tools
+          curl -fsSL https://gitee.com/oschina/repo/raw/fork_flow/repo-py3 -o .tools/repo
+          chmod +x .tools/repo
+          echo "$PWD/.tools" >> "$GITHUB_PATH"
+
+      - name: Sync OpenHarmony source
+        shell: bash
+        run: |
+          python3 scripts/sync_source.py \
+            --source work/openharmony \
+            --revision "${{ inputs.source_revision }}"
+
+      - name: Build static SDK
+        shell: bash
+        run: |
+          python3 scripts/build_static_sdk.py \
+            --source work/openharmony \
+            --target "${{ matrix.target }}" \
+            --download-prebuilts
+
+      - name: Upload static SDK
+        uses: actions/upload-artifact@v4
+        with:
+          name: arkdown-ets-static-${{ matrix.target }}
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 14

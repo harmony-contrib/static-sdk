@@ -1,0 +1,11 @@
+[project]
+name = "arkdown-static-sdk"
+version = "0.1.0"
+description = "Three-platform OpenHarmony ArkTS static SDK build controller"
+requires-python = ">=3.10"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.setuptools.package-data]
+static_sdk = ["assets/BUILD.gn"]
