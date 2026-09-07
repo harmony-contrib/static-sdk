@@ -9,6 +9,26 @@ supported by Arkdown:
 | `windows-x64` | Linux x86_64 | `win` |
 | `darwin-arm64` | macOS arm64 | `mac` |
 
+## Install
+
+Download the matching host package from the `v1.0.0` release and install it to
+`$HOME/.arkdown/static-sdk`:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/harmony-contrib/static-sdk/main/scripts/install.sh | bash -s -- --release v1.0.0
+```
+
+To merge `ets/static` into an existing OpenHarmony SDK, add
+`--prefix "$OHOS_SDK_HOME"`. The installer supports `linux-x64`,
+`windows-x64`, and `darwin-arm64`; it detects the current host by default. It
+verifies the SHA-256 digest published by GitHub, validates the archive before
+extracting it, and preserves an existing base `ets/NOTICE.txt`.
+
+An existing `ets/static` is never overwritten implicitly. Add `--force` to
+replace it atomically. This package supplies only the ArkTS 1.2 static slice;
+keep the other SDK components needed by the intended build in the same SDK
+root.
+
 This repository follows the source/orchestrator split used by
 [ark_standalone_build/manifest](https://gitee.com/ark_standalone_build/manifest),
 but targets the OpenHarmony SDK graph instead of the standalone VM graph. It is
