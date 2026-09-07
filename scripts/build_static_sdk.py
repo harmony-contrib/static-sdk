@@ -33,6 +33,11 @@ def main() -> int:
         action="store_true",
         help="keep generated product files in the disposable source tree for debugging",
     )
+    parser.add_argument(
+        "--jobs",
+        type=int,
+        help="limit parallel Ninja jobs for memory- or disk-constrained builders",
+    )
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument(
         "--dry-run",
@@ -45,6 +50,8 @@ def main() -> int:
         help="generate GN and run a Ninja dry run without compiling outputs",
     )
     args = parser.parse_args()
+    if args.jobs is not None and args.jobs < 1:
+        parser.error("--jobs must be at least 1")
 
     builder = StaticSdkBuilder(
         source=SourceTree(args.source),
@@ -54,6 +61,7 @@ def main() -> int:
         keep_overlay=args.keep_overlay,
         dry_run=args.dry_run,
         graph_only=args.graph_only,
+        ninja_jobs=args.jobs,
     )
     try:
         artifact = builder.run()

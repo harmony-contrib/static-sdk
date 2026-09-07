@@ -84,7 +84,8 @@ Build one artifact:
 ```bash
 python3 scripts/build_static_sdk.py \
   --source work/openharmony \
-  --target linux-x64
+  --target linux-x64 \
+  --jobs 4
 ```
 
 Validate product loading, GN generation, and the complete Ninja dependency
@@ -106,13 +107,17 @@ Artifacts are written to `dist/`:
 ```text
 arkdown-ets-static-<target>-<revision>.zip
 arkdown-ets-static-<target>-<revision>.zip.sha256
-arkdown-ets-static-<target>-<revision>.manifest.json
+arkdown-ets-static-<target>-<revision>.tar.gz
+arkdown-ets-static-<target>-<revision>.tar.gz.sha256
+arkdown-ets-static-<target>-<revision>.zip.manifest.json
 source-manifest-<target>-<revision>.xml
 ```
 
-The ZIP is the archive produced by OpenHarmony. The sidecar manifest records
-the exact commits of the SDK behavior owners and validates that the archive
-contains the complete static toolchain, APIs, stdlib, bindings, and plugins.
+The ZIP is the archive produced by OpenHarmony. The reproducible `.tar.gz`
+contains the same SDK tree with normalized archive metadata. The sidecar
+manifest records both digests and the exact commits of the SDK behavior owners,
+and validates that the archive contains the complete static toolchain, APIs,
+stdlib, bindings, and plugins.
 
 ## Build contract
 
@@ -127,6 +132,7 @@ enable_archive_sdk=true
 enable_process_notice=true
 sdk_check_flag=false
 is_llvm_build=true
+startup_init_with_param_base=true
 sdk_platform=linux|win|mac
 ```
 

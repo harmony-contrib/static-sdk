@@ -1,12 +1,18 @@
 from __future__ import annotations
 
+import gzip
 import hashlib
 import json
 import os
 import platform
 import re
+import shlex
 import shutil
+import stat
 import subprocess
+import sys
+import tarfile
+import tempfile
 import zipfile
 from contextlib import AbstractContextManager
 from dataclasses import dataclass
@@ -30,6 +36,7 @@ GENERATED_MODULES_RELATIVE_PATH = f"{GENERATED_RELATIVE_DIRECTORY}/ohos_sdk_modu
 GENERATED_INSTALL_RELATIVE_PATH = (
     f"{GENERATED_RELATIVE_DIRECTORY}/ohos_sdk_install_paths.json"
 )
+NOTICE_INSTALL_RELATIVE_PATH = "out/sdk/gen/build/ohos/sdk/ohos_sdk_install_paths.json"
 GENERATED_TYPES_RELATIVE_PATH = f"{GENERATED_RELATIVE_DIRECTORY}/generated_sdk_types.txt"
 
 
@@ -41,6 +48,7 @@ class Target:
     host_system: str
     host_machines: tuple[str, ...]
     clang_host_directory: str
+    python_host_directory: str
 
     def verify_host(self) -> None:
         actual_system = platform.system()
@@ -61,6 +69,7 @@ TARGETS = {
         host_system="Linux",
         host_machines=("x86_64", "amd64"),
         clang_host_directory="linux-x86_64",
+        python_host_directory="linux-x86",
     ),
     "windows-x64": Target(
         name="windows-x64",
@@ -69,6 +78,7 @@ TARGETS = {
         host_system="Linux",
         host_machines=("x86_64", "amd64"),
         clang_host_directory="linux-x86_64",
+        python_host_directory="linux-x86",
     ),
     "darwin-arm64": Target(
         name="darwin-arm64",
@@ -77,6 +87,7 @@ TARGETS = {
         host_system="Darwin",
         host_machines=("arm64", "aarch64"),
         clang_host_directory="darwin-arm64",
+        python_host_directory="darwin-arm64",
     ),
 }
 
@@ -133,6 +144,16 @@ class SourceTree:
             for name, relative_path in self.REVISION_OWNERS.items()
         }
 
+    def python_executable(self, target: Target) -> Path:
+        root = self.root / "prebuilts/python" / target.python_host_directory
+        candidates = sorted(root.glob("*/bin/python3"), reverse=True)
+        if not candidates:
+            raise RuntimeError(
+                "OpenHarmony Python prebuilt is incomplete; run "
+                f"build/prebuilts_download.sh first. Missing under: {root}"
+            )
+        return candidates[0]
+
     def clang_arguments(self, target: Target) -> tuple[str, ...]:
         toolchain_configuration = self.root / "build/toolchain/toolchain.gni"
         source = toolchain_configuration.read_text(encoding="utf-8")
@@ -182,11 +203,109 @@ class SourceTree:
             return False
         destination.parent.mkdir(parents=True, exist_ok=True)
         subprocess.run(
-            [str(repo_launcher), "manifest", "-r", "-o", str(destination)],
+            [
+                sys.executable,
+                str(repo_launcher),
+                "manifest",
+                "-r",
+                "-o",
+                str(destination),
+            ],
             cwd=self.root,
             check=True,
         )
         return True
+
+
+class DarwinBuildCompatibility(AbstractContextManager["DarwinBuildCompatibility"]):
+    """Supply host dependencies missing from the upstream Darwin prebuilts."""
+
+    SUPPORTED_VERSION_PATTERN = re.compile(r"^(?:10|11|12|13|14)\.\d+$")
+    COMPATIBLE_VERSION = "14.99"
+
+    def __init__(self, source: SourceTree, target: Target):
+        self.source = source
+        self.target = target
+        self._temporary_directory: tempfile.TemporaryDirectory[str] | None = None
+        self._bin_directory: Path | None = None
+
+    def __enter__(self) -> "DarwinBuildCompatibility":
+        if self.target.host_system != "Darwin":
+            return self
+
+        sdk_version = subprocess.run(
+            ["xcrun", "--sdk", "macosx", "--show-sdk-version"],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        if self.SUPPORTED_VERSION_PATTERN.fullmatch(sdk_version):
+            return self
+
+        xcrun = shutil.which("xcrun")
+        xcode_select = shutil.which("xcode-select")
+        if xcrun is None or xcode_select is None:
+            raise RuntimeError("Xcode command-line tools are not available")
+
+        self._temporary_directory = tempfile.TemporaryDirectory(
+            prefix="arkdown-xcode-compat-"
+        )
+        root = Path(self._temporary_directory.name)
+        developer = root / "Xcode.app/Contents/Developer"
+        sdk_directory = developer / "Platforms/MacOSX.platform/Developer/SDKs"
+        sdk_directory.mkdir(parents=True)
+        (sdk_directory / f"MacOSX{self.COMPATIBLE_VERSION}.sdk").mkdir()
+
+        self._bin_directory = root / "bin"
+        self._bin_directory.mkdir()
+        self._write_executable(
+            self._bin_directory / "xcode-select",
+            "#!/bin/sh\n"
+            'if [ "$#" -eq 1 ] && [ "$1" = "-print-path" ]; then\n'
+            f"  printf '%s\\n' {shlex.quote(str(developer))}\n"
+            "  exit 0\n"
+            "fi\n"
+            f"exec {shlex.quote(xcode_select)} \"$@\"\n",
+        )
+        self._write_executable(
+            self._bin_directory / "xcrun",
+            "#!/bin/sh\n"
+            'if [ "$#" -ge 2 ] && [ "$1" = "-sdk" ] && '
+            f'[ "$2" = "macosx{self.COMPATIBLE_VERSION}" ]; then\n'
+            "  shift 2\n"
+            f"  exec {shlex.quote(xcrun)} -sdk macosx \"$@\"\n"
+            "fi\n"
+            f"exec {shlex.quote(xcrun)} \"$@\"\n",
+        )
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback) -> None:
+        if self._temporary_directory is not None:
+            self._temporary_directory.cleanup()
+
+    def apply(self, environment: dict[str, str]) -> None:
+        if self.target.host_system != "Darwin":
+            return
+        bundled_python_modules = self.source.root / "third_party/PyYAML/lib"
+        if not (bundled_python_modules / "yaml/__init__.py").is_file():
+            raise RuntimeError(
+                "OpenHarmony Darwin Python is missing PyYAML and the bundled "
+                f"fallback is unavailable: {bundled_python_modules}"
+            )
+        existing_python_path = environment.get("PYTHONPATH", "")
+        environment["PYTHONPATH"] = os.pathsep.join(
+            item for item in (str(bundled_python_modules), existing_python_path) if item
+        )
+        if self._bin_directory is not None:
+            existing_path = environment.get("PATH", "")
+            environment["PATH"] = (
+                f"{self._bin_directory}{os.pathsep}{existing_path}"
+            )
+
+    @staticmethod
+    def _write_executable(path: Path, source: str) -> None:
+        path.write_text(source, encoding="utf-8")
+        path.chmod(0o755)
 
 
 class StaticSdkOverlay(AbstractContextManager["StaticSdkOverlay"]):
@@ -418,7 +537,7 @@ class StaticSdkOverlay(AbstractContextManager["StaticSdkOverlay"]):
             )
         subprocess.run(
             [
-                "python3",
+                str(self.source.python_executable(self.target)),
                 str(self.source.root / "build/ohos/sdk/parse_sdk_description.py"),
                 "--sdk-description-file",
                 str(self.description_path),
@@ -441,6 +560,17 @@ class StaticSdkOverlay(AbstractContextManager["StaticSdkOverlay"]):
             ],
             cwd=self.source.root,
             check=True,
+        )
+        # notice.gni imports sdk.gni in each installed module's target scope,
+        # where the install manifest resolves to the standard output path. The
+        # static-only product intentionally does not instantiate the full
+        # //build/ohos/sdk target that normally creates it, so materialize the
+        # same upstream-generated manifest before GN/Ninja starts.
+        notice_install_path = self.source.root / NOTICE_INSTALL_RELATIVE_PATH
+        notice_install_path.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(
+            self.source.root / GENERATED_INSTALL_RELATIVE_PATH,
+            notice_install_path,
         )
 
     def _select_product_components(
@@ -601,7 +731,7 @@ class StaticSdkArchive:
         "ets/static/api/",
         "ets/static/kits/",
         "ets/static/arkts/",
-        "ets/static/build-tools/ets2panda/bin/ets2panda",
+        "ets/static/build-tools/ets2panda/bin/es2panda",
         "ets/static/build-tools/ets2panda/bin/ark_link",
         "ets/static/build-tools/ets2panda/bin/ark_guard",
         "ets/static/build-tools/ets2panda/bin/dependency_analyzer",
@@ -616,7 +746,7 @@ class StaticSdkArchive:
 
     def validate(self) -> int:
         with zipfile.ZipFile(self.path) as archive:
-            names = [self._normalize(name) for name in archive.namelist()]
+            names = [self._validated_name(name) for name in archive.namelist()]
         dynamic = [name for name in names if "ets/dynamic/" in name]
         if dynamic:
             raise RuntimeError(
@@ -632,9 +762,53 @@ class StaticSdkArchive:
             raise RuntimeError(f"static SDK archive is incomplete; missing:\n{formatted}")
         return len(names)
 
+    def write_tar_gz(self, destination: Path) -> None:
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        with (
+            zipfile.ZipFile(self.path) as source,
+            destination.open("wb") as output,
+            gzip.GzipFile(
+                filename="", mode="wb", fileobj=output, mtime=0
+            ) as compressed,
+            tarfile.open(fileobj=compressed, mode="w") as archive,
+        ):
+            for source_info in sorted(source.infolist(), key=lambda item: item.filename):
+                name = self._validated_name(source_info.filename)
+                target_info = tarfile.TarInfo(name=name)
+                target_info.mtime = 0
+                target_info.uid = 0
+                target_info.gid = 0
+                target_info.uname = ""
+                target_info.gname = ""
+                source_mode = source_info.external_attr >> 16
+                mode = source_mode & 0o777
+                if source_info.is_dir():
+                    target_info.type = tarfile.DIRTYPE
+                    target_info.mode = mode or 0o755
+                    archive.addfile(target_info)
+                    continue
+                if stat.S_ISLNK(source_mode):
+                    target_info.type = tarfile.SYMTYPE
+                    target_info.mode = mode or 0o777
+                    target_info.linkname = source.read(source_info).decode("utf-8")
+                    archive.addfile(target_info)
+                    continue
+                target_info.mode = mode or 0o644
+                target_info.size = source_info.file_size
+                with source.open(source_info) as contents:
+                    archive.addfile(target_info, contents)
+
     @staticmethod
     def _normalize(name: str) -> str:
         return PurePosixPath(name.replace("\\", "/")).as_posix()
+
+    @classmethod
+    def _validated_name(cls, name: str) -> str:
+        normalized = cls._normalize(name)
+        path = PurePosixPath(normalized)
+        if path.is_absolute() or ".." in path.parts:
+            raise RuntimeError(f"unsafe SDK archive entry: {name}")
+        return normalized
 
 
 class StaticSdkBuilder:
@@ -653,6 +827,10 @@ class StaticSdkBuilder:
         "use_cfi=false",
         "use_thin_lto=false",
         "is_llvm_build=true",
+        # The LLVM-only musl graph does not inject parameterbase into libc.
+        # Keep libsystemparam self-contained when transitive host-tool support
+        # libraries select it through config_policy.
+        "startup_init_with_param_base=true",
     )
 
     def __init__(
@@ -664,6 +842,7 @@ class StaticSdkBuilder:
         keep_overlay: bool = False,
         dry_run: bool = False,
         graph_only: bool = False,
+        ninja_jobs: int | None = None,
     ):
         self.source = source
         self.target = target
@@ -672,6 +851,7 @@ class StaticSdkBuilder:
         self.keep_overlay = keep_overlay
         self.dry_run = dry_run
         self.graph_only = graph_only
+        self.ninja_jobs = ninja_jobs
 
     def run(self) -> Path | None:
         self.source.validate()
@@ -679,7 +859,9 @@ class StaticSdkBuilder:
         if self.download_prebuilts:
             self._download_prebuilts()
 
-        with StaticSdkOverlay(
+        with DarwinBuildCompatibility(
+            self.source, self.target
+        ) as host_compatibility, StaticSdkOverlay(
             self.source, target=self.target, keep=self.keep_overlay
         ) as overlay:
             command = self._build_command()
@@ -689,6 +871,7 @@ class StaticSdkBuilder:
             if self.dry_run:
                 return None
             environment = os.environ.copy()
+            host_compatibility.apply(environment)
             environment.update(
                 {
                     "CI": "true",
@@ -730,14 +913,22 @@ class StaticSdkBuilder:
         ]
         if self.graph_only:
             command.append("--ninja-args=-n")
+        elif self.ninja_jobs is not None:
+            command.append(f"--ninja-args=-j{self.ninja_jobs}")
         return command
 
     def _find_archive(self) -> Path:
         output_root = self.source.root / "out"
         candidates = sorted(
             path
-            for path in output_root.rglob("ets-*.zip")
-            if PRODUCT_NAME in path.parts and self.target.sdk_system in path.parts
+            for variant_root in output_root.iterdir()
+            if variant_root.is_dir()
+            for path in (
+                variant_root
+                / "packages"
+                / PRODUCT_NAME
+                / self.target.sdk_system
+            ).glob("ets-*.zip")
         )
         if len(candidates) != 1:
             rendered = "\n".join(f"  - {path}" for path in candidates) or "  (none)"
@@ -759,10 +950,18 @@ class StaticSdkBuilder:
         artifact.with_suffix(artifact.suffix + ".sha256").write_text(
             f"{digest}  {artifact.name}\n", encoding="utf-8"
         )
+        tarball = self.dist / f"arkdown-ets-static-{self.target.name}-{revision}.tar.gz"
+        archive.write_tar_gz(tarball)
+        tarball_digest = self._sha256(tarball)
+        tarball.with_suffix(tarball.suffix + ".sha256").write_text(
+            f"{tarball_digest}  {tarball.name}\n", encoding="utf-8"
+        )
         metadata = {
             "schemaVersion": 1,
             "artifact": artifact.name,
             "sha256": digest,
+            "gzipArtifact": tarball.name,
+            "gzipSha256": tarball_digest,
             "target": self.target.name,
             "sdkPlatform": self.target.sdk_platform,
             "sdkSystem": self.target.sdk_system,
@@ -782,7 +981,7 @@ class StaticSdkBuilder:
         )
         manifest_path = self.dist / f"source-manifest-{self.target.name}-{revision}.xml"
         self.source.write_pinned_manifest(manifest_path)
-        return artifact
+        return tarball
 
     @staticmethod
     def _sha256(path: Path) -> str:

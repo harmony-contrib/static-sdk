@@ -1,12 +1,18 @@
 from __future__ import annotations
 
 import json
+import stat
+import sys
+import tarfile
 import tempfile
 import unittest
 import zipfile
 from pathlib import Path
+from unittest.mock import patch
 
 from static_sdk.builder import (
+    DarwinBuildCompatibility,
+    NOTICE_INSTALL_RELATIVE_PATH,
     PRODUCT_NAME,
     PRODUCT_SELECTOR,
     SourceTree,
@@ -17,7 +23,83 @@ from static_sdk.builder import (
 )
 
 
+class DarwinBuildCompatibilityTests(unittest.TestCase):
+    @patch("static_sdk.builder.shutil.which")
+    @patch("static_sdk.builder.subprocess.run")
+    def test_maps_new_xcode_sdk_to_legacy_probe_name(self, run, which) -> None:
+        run.return_value.stdout = "15.2\n"
+        which.side_effect = lambda command: f"/usr/bin/{command}"
+
+        with tempfile.TemporaryDirectory() as source_directory:
+            python_modules = Path(source_directory) / "third_party/PyYAML/lib/yaml"
+            python_modules.mkdir(parents=True)
+            (python_modules / "__init__.py").write_text("")
+            with DarwinBuildCompatibility(
+                SourceTree(Path(source_directory)), TARGETS["darwin-arm64"]
+            ) as compatibility:
+                environment = {"PATH": "/usr/bin"}
+                compatibility.apply(environment)
+                bin_directory = Path(environment["PATH"].split(":", 1)[0])
+                developer = bin_directory.parent / "Xcode.app/Contents/Developer"
+
+                self.assertTrue(
+                    (
+                        developer
+                        / "Platforms/MacOSX.platform/Developer/SDKs/MacOSX14.99.sdk"
+                    ).is_dir()
+                )
+                self.assertIn("macosx14.99", (bin_directory / "xcrun").read_text())
+                self.assertIn(
+                    str(developer), (bin_directory / "xcode-select").read_text()
+                )
+                self.assertEqual(
+                    str(python_modules.parent.resolve()), environment["PYTHONPATH"]
+                )
+
+            self.assertFalse(bin_directory.exists())
+
+    @patch("static_sdk.builder.subprocess.run")
+    def test_uses_supported_xcode_sdk_without_compatibility(self, run) -> None:
+        run.return_value.stdout = "14.5\n"
+
+        with tempfile.TemporaryDirectory() as source_directory:
+            python_modules = Path(source_directory) / "third_party/PyYAML/lib/yaml"
+            python_modules.mkdir(parents=True)
+            (python_modules / "__init__.py").write_text("")
+            with DarwinBuildCompatibility(
+                SourceTree(Path(source_directory)), TARGETS["darwin-arm64"]
+            ) as compatibility:
+                environment = {"PATH": "/usr/bin"}
+                compatibility.apply(environment)
+
+            self.assertEqual("/usr/bin", environment["PATH"])
+            self.assertEqual(
+                str(python_modules.parent.resolve()), environment["PYTHONPATH"]
+            )
+
+
 class StaticSdkOverlayTests(unittest.TestCase):
+    def test_writes_manifest_with_current_python_interpreter(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            launcher = root / ".repo/repo/repo"
+            launcher.parent.mkdir(parents=True)
+            launcher.write_text(
+                """from pathlib import Path
+import sys
+
+assert sys.argv[1:3] == ['manifest', '-r']
+Path(sys.argv[4]).write_text('<manifest/>')
+""",
+                encoding="utf-8",
+            )
+            destination = root / "dist/source.xml"
+
+            written = SourceTree(root).write_pinned_manifest(destination)
+
+            self.assertTrue(written)
+            self.assertEqual("<manifest/>", destination.read_text(encoding="utf-8"))
+
     def test_filters_upstream_description_and_preserves_product_features(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
             root = Path(temporary_directory)
@@ -64,6 +146,12 @@ class StaticSdkOverlayTests(unittest.TestCase):
                 self.assertIn(
                     'group("arkdown_static_sdk")',
                     overlay.product_build_path.read_text(encoding="utf-8"),
+                )
+                self.assertEqual(
+                    [],
+                    json.loads(
+                        (root / NOTICE_INSTALL_RELATIVE_PATH).read_text(encoding="utf-8")
+                    ),
                 )
                 self.assertNotIn(
                     "ohos_ndk",
@@ -126,6 +214,7 @@ class StaticSdkOverlayTests(unittest.TestCase):
         self.assertEqual("arkdown_static_sdk", command[5])
         self.assertIn("--load-test-config=false", command)
         self.assertIn("is_llvm_build=true", command[-1])
+        self.assertIn("startup_init_with_param_base=true", command[-1])
         self.assertIn(
             "clang_base_path=//prebuilts/clang/ohos/linux-x86_64/llvm",
             command[-1],
@@ -143,6 +232,19 @@ class StaticSdkOverlayTests(unittest.TestCase):
             )
 
             self.assertEqual("--ninja-args=-n", builder._build_command()[-1])
+
+    def test_limits_ninja_parallelism_for_real_builds(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            self._write_source_fixture(root)
+            builder = StaticSdkBuilder(
+                source=SourceTree(root),
+                target=TARGETS["linux-x64"],
+                dist=root / "dist",
+                ninja_jobs=8,
+            )
+
+            self.assertEqual("--ninja-args=-j8", builder._build_command()[-1])
 
     def test_maps_all_targets_to_upstream_platforms_and_host_clang(self) -> None:
         expected = {
@@ -167,6 +269,27 @@ class StaticSdkOverlayTests(unittest.TestCase):
                     f"clang_base_path=//prebuilts/clang/ohos/{clang_directory}/llvm",
                     gn_arguments,
                 )
+
+    def test_finds_archive_only_in_the_product_platform_directory(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            self._write_source_fixture(root)
+            expected = (
+                root
+                / "out/sdk/packages/arkdown-static-sdk/linux/ets-linux-x64.zip"
+            )
+            expected.parent.mkdir(parents=True)
+            expected.write_bytes(b"archive")
+            unrelated = root / "out/old/nested/archive/ets-unrelated.zip"
+            unrelated.parent.mkdir(parents=True)
+            unrelated.write_bytes(b"unrelated")
+            builder = StaticSdkBuilder(
+                source=SourceTree(root),
+                target=TARGETS["linux-x64"],
+                dist=root / "dist",
+            )
+
+            self.assertEqual(expected.resolve(), builder._find_archive())
 
     @staticmethod
     def _write_source_fixture(root: Path) -> None:
@@ -237,6 +360,15 @@ Path(args.sdk_types_file).write_text('ets')
             )
             libcxxabi_path.parent.mkdir(parents=True)
             libcxxabi_path.write_text("", encoding="utf-8")
+        for python_host_directory in ("linux-x86", "darwin-arm64"):
+            python_path = (
+                root
+                / "prebuilts/python"
+                / python_host_directory
+                / "3.12.10/bin/python3"
+            )
+            python_path.parent.mkdir(parents=True)
+            python_path.symlink_to(sys.executable)
         product_path = root / "productdefine/common/products/ohos-sdk.json"
         product_path.parent.mkdir(parents=True)
         host_product_path = root / "vendor/ohemu/host_product/config.json"
@@ -300,6 +432,59 @@ class StaticSdkArchiveTests(unittest.TestCase):
                     archive.writestr(name, b"fixture")
             count = StaticSdkArchive(archive_path).validate()
             self.assertEqual(len(StaticSdkArchive.REQUIRED_PATH_FRAGMENTS), count)
+
+    def test_requires_upstream_es2panda_executable_name(self) -> None:
+        self.assertIn(
+            "ets/static/build-tools/ets2panda/bin/es2panda",
+            StaticSdkArchive.REQUIRED_PATH_FRAGMENTS,
+        )
+        self.assertNotIn(
+            "ets/static/build-tools/ets2panda/bin/ets2panda",
+            StaticSdkArchive.REQUIRED_PATH_FRAGMENTS,
+        )
+
+    def test_writes_reproducible_tar_gz_with_the_same_sdk_tree(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            archive_path = root / "ets.zip"
+            first_tarball = root / "first.tar.gz"
+            second_tarball = root / "second.tar.gz"
+            with zipfile.ZipFile(archive_path, "w") as archive:
+                archive.writestr("ets/static/api/example.d.ts", b"export {}")
+                executable = zipfile.ZipInfo("ets/static/build-tools/tool")
+                executable.external_attr = (stat.S_IFREG | 0o755) << 16
+                archive.writestr(executable, b"#!/bin/sh\n")
+                symlink = zipfile.ZipInfo("ets/static/build-tools/tool-link")
+                symlink.external_attr = (stat.S_IFLNK | 0o777) << 16
+                archive.writestr(symlink, b"tool")
+
+            sdk_archive = StaticSdkArchive(archive_path)
+            sdk_archive.write_tar_gz(first_tarball)
+            sdk_archive.write_tar_gz(second_tarball)
+
+            self.assertEqual(first_tarball.read_bytes(), second_tarball.read_bytes())
+            with tarfile.open(first_tarball, "r:gz") as archive:
+                self.assertEqual(
+                    b"export {}",
+                    archive.extractfile("ets/static/api/example.d.ts").read(),
+                )
+                self.assertEqual(
+                    0o755,
+                    archive.getmember("ets/static/build-tools/tool").mode,
+                )
+                link = archive.getmember("ets/static/build-tools/tool-link")
+                self.assertTrue(link.issym())
+                self.assertEqual("tool", link.linkname)
+
+    def test_rejects_unsafe_archive_entry_while_writing_tar_gz(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            archive_path = root / "ets.zip"
+            with zipfile.ZipFile(archive_path, "w") as archive:
+                archive.writestr("../outside", b"fixture")
+
+            with self.assertRaisesRegex(RuntimeError, "unsafe"):
+                StaticSdkArchive(archive_path).write_tar_gz(root / "ets.tar.gz")
 
     def test_rejects_dynamic_payload(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
