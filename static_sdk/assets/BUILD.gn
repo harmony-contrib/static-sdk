@@ -6,12 +6,33 @@
 # deliberately does not instantiate the upstream NDK validation/signing graph.
 
 import("//build/ohos/build_var.gni")
+import("//build/ohos.gni")
 import("//build/ohos/sdk/sdk.gni")
 import("//.arkdown-static-sdk/generated/ohos_sdk_modules.gni")
 
 generated_sdk_module_install_paths =
     "//.arkdown-static-sdk/generated/ohos_sdk_install_paths.json"
 static_ets_modules = ohos_sdk_modules.ets
+
+# The current libarkts Rollup output intentionally retains
+# `require("@koalaui/compat")`, and libarkts/package.json declares the sibling
+# compat package as a runtime dependency. Stage exactly that package beside
+# libarkts so the SDK artifact preserves the source-defined Node resolution
+# contract.
+ohos_copy("libarkts_compat_runtime") {
+  deps = [
+    "//developtools/ace_ets2bundle/ets1.2/libarkts:compile(${host_toolchain})",
+  ]
+  sources = [
+    "//developtools/ace_ets2bundle/ets1.2/compat/build",
+    "//developtools/ace_ets2bundle/ets1.2/compat/package.json",
+  ]
+  outputs = [ "$target_out_dir/$target_name/{{source_file_part}}" ]
+  module_source_dir = target_out_dir + "/$target_name"
+  module_install_name = ""
+  subsystem_name = "developtools"
+  part_name = "ace_ets2bundle"
+}
 
 if (sdk_platform == "linux") {
   make_linux_sdk_modules("arkdown_ets_static") {
