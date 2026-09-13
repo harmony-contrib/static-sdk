@@ -31,7 +31,11 @@ INNER_KITS_ALLOWLIST_RELATIVE_PATH = (
 PRODUCT_RELATIVE_PATH = "vendor/arkdown/arkdown-static-sdk/config.json"
 PRODUCT_BUNDLE_RELATIVE_PATH = "vendor/arkdown/arkdown-static-sdk/bundle.json"
 PRODUCT_BUILD_RELATIVE_PATH = "vendor/arkdown/arkdown-static-sdk/BUILD.gn"
+PRODUCT_COMPAT_STAGE_RELATIVE_PATH = (
+    "vendor/arkdown/arkdown-static-sdk/stage_compat.py"
+)
 PRODUCT_BUILD_ASSET = Path(__file__).with_name("assets") / "BUILD.gn"
+PRODUCT_COMPAT_STAGE_ASSET = Path(__file__).with_name("assets") / "stage_compat.py"
 GENERATED_RELATIVE_DIRECTORY = ".arkdown-static-sdk/generated"
 GENERATED_MODULES_RELATIVE_PATH = f"{GENERATED_RELATIVE_DIRECTORY}/ohos_sdk_modules.gni"
 GENERATED_INSTALL_RELATIVE_PATH = (
@@ -97,6 +101,62 @@ TARGETS = {
 
 
 class SourceTree:
+    NODE_DEPENDENCY_STAMP = "node_modules/.arkdown-static-sdk-dependencies.json"
+
+    NODE_PROJECTS = {
+        "arkcompiler/ets_frontend/ets2panda/bindings": (
+            "node_modules/node-api-headers/include/node_api.h",
+            "node_modules/.bin/tsc",
+        ),
+        "arkcompiler/ets_frontend/ets2panda/driver/build_system": (
+            "node_modules/.bin/tsc",
+        ),
+        "arkcompiler/ets_frontend/ets2panda/linter": (
+            "node_modules/.bin/webpack",
+            "node_modules/@types/node/package.json",
+        ),
+        "arkcompiler/ets_frontend/ets2panda/linter/arkanalyzer": (
+            "node_modules/commander/package.json",
+            "node_modules/log4js/package.json",
+        ),
+        "arkcompiler/ets_frontend/ets2panda/linter/homecheck": (
+            "node_modules/commander/package.json",
+            "node_modules/fs-extra/package.json",
+        ),
+        "arkcompiler/ets_frontend/arkguard": (
+            "node_modules/@types/node/package.json",
+            "node_modules/fs-extra/package.json",
+        ),
+        "arkcompiler/runtime_core/static_core/plugins/ets/tools/declgen_ts2sts": (
+            "node_modules/.bin/tsc",
+            "node_modules/commander/index.js",
+        ),
+        "developtools/ace_ets2bundle/koala-wrapper": (
+            "node_modules/node-api-headers/include/node_api.h",
+            "node_modules/node-addon-api/napi.h",
+            "node_modules/.bin/babel",
+        ),
+        "developtools/ace_ets2bundle/ets1.2": (
+            "node_modules/node-api-headers/include/node_api.h",
+            "node_modules/node-addon-api/napi.h",
+            "node_modules/.bin/rollup",
+            "node_modules/.bin/tsc",
+        ),
+        "developtools/ace_ets2bundle/ets1.2/compat": (
+            "node_modules/.bin/tsc",
+        ),
+        "developtools/ace_ets2bundle/arkui-plugins": (
+            "node_modules/.bin/babel",
+        ),
+        "interface/sdk-js/build-tools": (
+            "node_modules/typescript/lib/typescript.js",
+            "node_modules/commander/index.js",
+        ),
+        "interface/sdk-js/build-tools/compile-plugins/api-check-plugin-static": (
+            "node_modules/.bin/babel",
+        ),
+    }
+
     REQUIRED_PATHS = (
         "build.sh",
         "build/ohos/sdk/ohos_sdk_description_std.json",
@@ -158,6 +218,101 @@ class SourceTree:
             )
         return candidates[0]
 
+    def prepare_node_dependencies(self) -> None:
+        """Install npm dependencies required by the selected ETS SDK graph."""
+        node_bin = self.root / "prebuilts/build-tools/common/nodejs/current/bin"
+        node = node_bin / "node"
+        npm = node_bin / "npm"
+        missing_tools = [path for path in (node, npm) if not path.is_file()]
+        if missing_tools:
+            formatted = "\n".join(f"  - {path}" for path in missing_tools)
+            raise RuntimeError(
+                "OpenHarmony Node.js prebuilts are incomplete; run "
+                "build/prebuilts_download.sh first. Missing:\n"
+                f"{formatted}"
+            )
+
+        environment = os.environ.copy()
+        environment["PATH"] = f"{node_bin}{os.pathsep}{environment.get('PATH', '')}"
+        environment["CI"] = "true"
+        for relative_path, markers in self.NODE_PROJECTS.items():
+            project = self.root / relative_path
+            expected_stamp = self._node_dependency_stamp(project)
+            stamp_path = project / self.NODE_DEPENDENCY_STAMP
+            if (
+                all((project / marker).exists() for marker in markers)
+                and stamp_path.is_file()
+                and stamp_path.read_text(encoding="utf-8") == expected_stamp
+            ):
+                continue
+            if not (project / "package.json").is_file():
+                raise RuntimeError(
+                    f"ETS npm project is missing package.json: {relative_path}"
+                )
+            print(f"Preparing ETS npm dependencies: {relative_path}")
+            lockfile = project / "package-lock.json"
+            common_arguments = ["--ignore-scripts", "--no-audit", "--no-fund"]
+            if lockfile.is_file():
+                original_lockfile = lockfile.read_bytes()
+                try:
+                    subprocess.run(
+                        [str(npm), "ci", *common_arguments],
+                        cwd=project,
+                        env=environment,
+                        check=True,
+                    )
+                except subprocess.CalledProcessError:
+                    print(
+                        "Upstream package lock is not installable with npm ci; "
+                        f"using it as an npm install baseline: {relative_path}"
+                    )
+                    # npm ci may leave a partially linked tree when an upstream
+                    # local-file dependency is inconsistent.  npm 6 cannot
+                    # reliably repair that tree in place, so give the fallback
+                    # install the same clean starting point.
+                    shutil.rmtree(project / "node_modules", ignore_errors=True)
+                    try:
+                        subprocess.run(
+                            [str(npm), "install", *common_arguments],
+                            cwd=project,
+                            env=environment,
+                            check=True,
+                        )
+                    finally:
+                        lockfile.write_bytes(original_lockfile)
+                else:
+                    if lockfile.read_bytes() != original_lockfile:
+                        lockfile.write_bytes(original_lockfile)
+                        raise RuntimeError(
+                            f"npm ci unexpectedly changed package lock: {relative_path}"
+                        )
+            else:
+                subprocess.run(
+                    [str(npm), "install", *common_arguments, "--package-lock=false"],
+                    cwd=project,
+                    env=environment,
+                    check=True,
+                )
+            missing = [marker for marker in markers if not (project / marker).exists()]
+            if missing:
+                formatted = "\n".join(f"  - {marker}" for marker in missing)
+                raise RuntimeError(
+                    f"npm install did not prepare {relative_path}; missing:\n{formatted}"
+                )
+            stamp_path.write_text(expected_stamp, encoding="utf-8")
+
+    @staticmethod
+    def _node_dependency_stamp(project: Path) -> str:
+        inputs = {}
+        for name in ("package.json", "package-lock.json"):
+            path = project / name
+            inputs[name] = (
+                hashlib.sha256(path.read_bytes()).hexdigest() if path.is_file() else None
+            )
+        return json.dumps(
+            {"schema": 1, "inputs": inputs}, sort_keys=True, separators=(",", ":")
+        )
+
     def clang_arguments(self, target: Target) -> tuple[str, ...]:
         toolchain_configuration = self.root / "build/toolchain/toolchain.gni"
         source = toolchain_configuration.read_text(encoding="utf-8")
@@ -208,7 +363,7 @@ class SourceTree:
         destination.parent.mkdir(parents=True, exist_ok=True)
 
         listed = subprocess.run(
-            [sys.executable, str(repo_launcher), "list", "-a"],
+            [sys.executable, str(repo_launcher), "list"],
             cwd=self.root,
             check=True,
             capture_output=True,
@@ -226,7 +381,7 @@ class SourceTree:
             for project in projects
             if (self.root / project[0] / ".git").exists()
         ]
-        if projects and len(checked_out) != len(projects):
+        if checked_out:
             self._write_partial_pinned_manifest(destination, checked_out)
             return True
 
@@ -400,6 +555,68 @@ class DarwinBuildCompatibility(AbstractContextManager["DarwinBuildCompatibility"
         path.chmod(0o755)
 
 
+class Node14PackageCompatibility(AbstractContextManager["Node14PackageCompatibility"]):
+    """Use shell cleanup where API 26 packages pin Node 20-only rimraf 6."""
+
+    PACKAGE_PATCHES = {
+        "arkcompiler/ets_frontend/ets2panda/bindings/package.json": (
+            '"clean": "rimraf dist tsconfig.tsbuildinfo package-lock.json"',
+            '"clean": "rm -rf dist tsconfig.tsbuildinfo package-lock.json"',
+        ),
+        "arkcompiler/ets_frontend/ets2panda/driver/build_system/package.json": (
+            '"clean": "rimraf ${npm_config_outdir:-dist}"',
+            '"clean": "rm -rf ${npm_config_outdir:-dist}"',
+        ),
+        (
+            "arkcompiler/runtime_core/static_core/plugins/ets/tools/"
+            "declgen_ts2sts/package.json"
+        ): (
+            '"clean": "rimraf build dist bundle"',
+            '"clean": "rm -rf build dist bundle"',
+        ),
+    }
+
+    def __init__(self, source: SourceTree):
+        self.source = source
+        self.original_sources: dict[Path, str] = {}
+        self.original_lockfiles: dict[Path, bytes | None] = {}
+
+    def __enter__(self) -> "Node14PackageCompatibility":
+        try:
+            for relative_path, (original, replacement) in self.PACKAGE_PATCHES.items():
+                path = self.source.root / relative_path
+                lockfile = path.with_name("package-lock.json")
+                self.original_lockfiles[lockfile] = (
+                    lockfile.read_bytes() if lockfile.is_file() else None
+                )
+                source = path.read_text(encoding="utf-8")
+                if source.count(original) != 1:
+                    raise RuntimeError(
+                        "unexpected upstream npm clean script; refusing to apply "
+                        f"Node 14 compatibility at {path}"
+                    )
+                self.original_sources[path] = source
+                path.write_text(source.replace(original, replacement), encoding="utf-8")
+            return self
+        except BaseException:
+            self._restore()
+            raise
+
+    def __exit__(self, exc_type, exc_value, traceback) -> None:
+        self._restore()
+
+    def _restore(self) -> None:
+        for path, source in self.original_sources.items():
+            path.write_text(source, encoding="utf-8")
+        for path, source in self.original_lockfiles.items():
+            if source is None:
+                path.unlink(missing_ok=True)
+            else:
+                path.write_bytes(source)
+        self.original_sources.clear()
+        self.original_lockfiles.clear()
+
+
 class StaticSdkOverlay(AbstractContextManager["StaticSdkOverlay"]):
     EXCLUDED_COMPONENTS = frozenset({"ace_engine"})
 
@@ -544,6 +761,9 @@ class StaticSdkOverlay(AbstractContextManager["StaticSdkOverlay"]):
         self.product_path = source.root / PRODUCT_RELATIVE_PATH
         self.product_bundle_path = source.root / PRODUCT_BUNDLE_RELATIVE_PATH
         self.product_build_path = source.root / PRODUCT_BUILD_RELATIVE_PATH
+        self.product_compat_stage_path = (
+            source.root / PRODUCT_COMPAT_STAGE_RELATIVE_PATH
+        )
         self.generated_directory = source.root / GENERATED_RELATIVE_DIRECTORY
         self.entry_count = 0
 
@@ -556,6 +776,7 @@ class StaticSdkOverlay(AbstractContextManager["StaticSdkOverlay"]):
                 self.product_path,
                 self.product_bundle_path,
                 self.product_build_path,
+                self.product_compat_stage_path,
             )
             if path.exists()
         ]
@@ -620,6 +841,9 @@ class StaticSdkOverlay(AbstractContextManager["StaticSdkOverlay"]):
                 encoding="utf-8",
             )
             shutil.copy2(PRODUCT_BUILD_ASSET, self.product_build_path)
+            shutil.copy2(
+                PRODUCT_COMPAT_STAGE_ASSET, self.product_compat_stage_path
+            )
             self._generate_sdk_metadata()
             self.entry_count = len(static_entries)
             return self
@@ -766,6 +990,7 @@ class StaticSdkOverlay(AbstractContextManager["StaticSdkOverlay"]):
         self.product_path.unlink(missing_ok=True)
         self.product_bundle_path.unlink(missing_ok=True)
         self.product_build_path.unlink(missing_ok=True)
+        self.product_compat_stage_path.unlink(missing_ok=True)
         self.description_path.unlink(missing_ok=True)
         self.inner_kits_allowlist_path.unlink(missing_ok=True)
         shutil.rmtree(self.generated_directory, ignore_errors=True)
@@ -961,8 +1186,10 @@ class StaticSdkBuilder:
         self.target.verify_host()
         if self.download_prebuilts:
             self._download_prebuilts()
+        if not self.dry_run and not self.graph_only:
+            self.source.prepare_node_dependencies()
 
-        with DarwinBuildCompatibility(
+        with Node14PackageCompatibility(self.source), DarwinBuildCompatibility(
             self.source, self.target
         ) as host_compatibility, StaticSdkOverlay(
             self.source, target=self.target, keep=self.keep_overlay

@@ -64,17 +64,35 @@ archive and NOTICE templates directly; it never instantiates the NDK or
 full-SDK verification/signing targets.
 
 Source synchronization uses the official OpenHarmony API 26 manifest but asks
-`repo sync` for only the 72 projects in the verified `ets/static` source and
+`repo sync` for only the 90 projects in the verified three-platform
+`ets/static` source and
 metadata closure. It does not check out application products, device products,
 full kernel trees, or other system services. The standalone manifest cannot be
 used as-is because it omits the complete `interface/sdk-js` and
 `developtools/ace_ets2bundle` packaging path required by `ets/static`.
 
+For a clean source tree, the builder prepares npm dependencies only for the 13
+ETS delivery projects that require them: es2panda `bindings`, `build_system`,
+and the three linter packages; ArkGuard; the ETS `declgen_ts2sts` tool;
+`koala-wrapper`; `ets1.2` and its compat package; `arkui-plugins`; and the
+`interface/sdk-js` build tools and static API check plugin. It uses the
+OpenHarmony Node.js prebuilt, disables install scripts, honors upstream package
+locks with `npm ci`, and does not write new package locks where upstream does
+not provide one. If an upstream lock is already inconsistent with its package
+manifest, the builder uses it as the `npm install` baseline and restores the
+original lock byte-for-byte.
+
+The API 26 bindings, build-system, and declgen packages pin Node 20-only
+`rimraf` while the same source build requires Node 14. The builder temporarily
+replaces only those packages' cleanup command with equivalent shell cleanup;
+their compile and generation tasks stay unchanged, and package files and locks
+are restored when the build exits.
+
 ## Prerequisites
 
 - Python 3.10 or newer.
 - Git and the `repo` launcher.
-- Enough free disk space for the reduced 72-project checkout, required host
+- Enough free disk space for the reduced 90-project checkout, required host
   prebuilts, and its single-target build output; a full OpenHarmony checkout is
   neither needed nor performed.
 - Linux x86_64 for Linux and Windows artifacts.
