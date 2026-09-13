@@ -55,22 +55,28 @@ the roughly 181-component definition used by the complete OpenHarmony SDK.
 Each retained component keeps its upstream inner-kit metadata so GN can resolve
 typed `external_deps`, but its default product module list is pruned. An upstream
 `check_innerkits_path` allowlist also disables bulk-building every declared
-inner kit. Direct dependency edges remain active, so the SDK description's
-current 35 `ets/static` delivery labels are the only artifact roots. The custom
-GN composition instantiates OpenHarmony's archive and NOTICE templates
-directly; it never instantiates the NDK or full-SDK verification/signing targets.
+inner kit. Direct dependency edges remain active, so the upstream `ets/static`
+delivery labels remain the artifact roots. The only additional delivery target
+stages `@koalaui/compat` beside `libarkts`: current upstream `libarkts.js`
+requires it at runtime and `libarkts/package.json` declares that exact sibling
+package as a dependency. The custom GN composition instantiates OpenHarmony's
+archive and NOTICE templates directly; it never instantiates the NDK or
+full-SDK verification/signing targets.
 
-Source synchronization currently uses the official OpenHarmony manifest. The
-standalone manifest cannot be used as-is: it does not include the complete
-`interface/sdk-js` and `developtools/ace_ets2bundle` packaging path required by
-`ets/static`. The compile and package graph is static-only even though the
-initial source checkout is not yet a reduced manifest.
+Source synchronization uses the official OpenHarmony API 26 manifest but asks
+`repo sync` for only the 72 projects in the verified `ets/static` source and
+metadata closure. It does not check out application products, device products,
+full kernel trees, or other system services. The standalone manifest cannot be
+used as-is because it omits the complete `interface/sdk-js` and
+`developtools/ace_ets2bundle` packaging path required by `ets/static`.
 
 ## Prerequisites
 
 - Python 3.10 or newer.
 - Git and the `repo` launcher.
-- About 200 GB of free disk space for a clean OpenHarmony checkout and build.
+- Enough free disk space for the reduced 72-project checkout, required host
+  prebuilts, and its single-target build output; a full OpenHarmony checkout is
+  neither needed nor performed.
 - Linux x86_64 for Linux and Windows artifacts.
 - Apple Silicon macOS for the Darwin arm64 artifact.
 
@@ -89,8 +95,7 @@ Create a disposable OpenHarmony source tree:
 
 ```bash
 python3 scripts/sync_source.py \
-  --source work/openharmony \
-  --revision master
+  --source work/openharmony
 ```
 
 Download host prebuilts once:

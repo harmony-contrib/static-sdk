@@ -14,6 +14,7 @@ import sys
 import tarfile
 import tempfile
 import zipfile
+import xml.etree.ElementTree as ElementTree
 from contextlib import AbstractContextManager
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -38,6 +39,9 @@ GENERATED_INSTALL_RELATIVE_PATH = (
 )
 NOTICE_INSTALL_RELATIVE_PATH = "out/sdk/gen/build/ohos/sdk/ohos_sdk_install_paths.json"
 GENERATED_TYPES_RELATIVE_PATH = f"{GENERATED_RELATIVE_DIRECTORY}/generated_sdk_types.txt"
+LIBARKTS_COMPAT_INSTALL_PATH = (
+    "ets/static/build-tools/libarkts/node_modules/@koalaui/compat/"
+)
 
 
 @dataclass(frozen=True)
@@ -202,6 +206,30 @@ class SourceTree:
         if not repo_launcher.is_file():
             return False
         destination.parent.mkdir(parents=True, exist_ok=True)
+
+        listed = subprocess.run(
+            [sys.executable, str(repo_launcher), "list", "-a"],
+            cwd=self.root,
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.splitlines()
+        projects = []
+        for line in listed:
+            relative_path, separator, name = line.partition(" : ")
+            if not separator:
+                raise RuntimeError(f"unexpected repo list output: {line!r}")
+            projects.append((relative_path, name))
+
+        checked_out = [
+            project
+            for project in projects
+            if (self.root / project[0] / ".git").exists()
+        ]
+        if projects and len(checked_out) != len(projects):
+            self._write_partial_pinned_manifest(destination, checked_out)
+            return True
+
         subprocess.run(
             [
                 sys.executable,
@@ -215,6 +243,70 @@ class SourceTree:
             check=True,
         )
         return True
+
+    def _write_partial_pinned_manifest(
+        self, destination: Path, projects: Sequence[tuple[str, str]]
+    ) -> None:
+        """Write a reproducible manifest for the projects present in a partial tree."""
+
+        pinned = []
+        for relative_path, name in projects:
+            project_root = self.root / relative_path
+            revision = self.revision(relative_path)
+            remote_names = subprocess.run(
+                ["git", "-C", str(project_root), "remote"],
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout.splitlines()
+            if not remote_names:
+                raise RuntimeError(f"source project has no remote: {relative_path}")
+            remote_name = "gitcode" if "gitcode" in remote_names else remote_names[0]
+            remote_url = subprocess.run(
+                ["git", "-C", str(project_root), "remote", "get-url", remote_name],
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout.strip()
+            suffixes = (f"/{name}.git", f"/{name}")
+            fetch = next(
+                (
+                    remote_url[: -len(suffix)]
+                    for suffix in suffixes
+                    if remote_url.endswith(suffix)
+                ),
+                None,
+            )
+            if fetch is None:
+                raise RuntimeError(
+                    f"cannot derive manifest remote for {relative_path}: {remote_url}"
+                )
+            pinned.append((relative_path, name, revision, fetch))
+
+        manifest = ElementTree.Element("manifest")
+        remote_names_by_fetch = {
+            fetch: f"remote-{index}"
+            for index, fetch in enumerate(sorted({item[3] for item in pinned}))
+        }
+        for fetch, remote_name in remote_names_by_fetch.items():
+            ElementTree.SubElement(
+                manifest, "remote", {"name": remote_name, "fetch": fetch}
+            )
+        for relative_path, name, revision, fetch in pinned:
+            ElementTree.SubElement(
+                manifest,
+                "project",
+                {
+                    "name": name,
+                    "path": relative_path,
+                    "remote": remote_names_by_fetch[fetch],
+                    "revision": revision,
+                },
+            )
+        ElementTree.indent(manifest, space="  ")
+        ElementTree.ElementTree(manifest).write(
+            destination, encoding="utf-8", xml_declaration=True
+        )
 
 
 class DarwinBuildCompatibility(AbstractContextManager["DarwinBuildCompatibility"]):
@@ -482,6 +574,15 @@ class StaticSdkOverlay(AbstractContextManager["StaticSdkOverlay"]):
                 if str(entry.get("install_dir", "")).startswith("ets/static/")
             ]
             self._validate_description(static_entries)
+            static_entries.append(
+                {
+                    "install_dir": LIBARKTS_COMPAT_INSTALL_PATH,
+                    "module_label": (
+                        "//vendor/arkdown/arkdown-static-sdk:libarkts_compat_runtime"
+                    ),
+                    "target_os": ["linux", "windows", "darwin", "linux_arm64"],
+                }
+            )
 
             host_product = self.source.root / "vendor/ohemu/host_product/config.json"
             product = json.loads(host_product.read_text(encoding="utf-8"))
@@ -737,6 +838,8 @@ class StaticSdkArchive:
         "ets/static/build-tools/ets2panda/bin/dependency_analyzer",
         "ets/static/build-tools/ets2panda/lib/etsstdlib.abc",
         "ets/static/build-tools/libarkts/",
+        "ets/static/build-tools/libarkts/node_modules/@koalaui/compat/package.json",
+        "ets/static/build-tools/libarkts/node_modules/@koalaui/compat/build/src/index.js",
         "ets/static/build-tools/bindings/",
         "ets/static/build-tools/ui-plugins/",
     )
@@ -867,7 +970,7 @@ class StaticSdkBuilder:
             command = self._build_command()
             print("Build command:")
             print(" ".join(command))
-            print(f"Selected {overlay.entry_count} upstream ets/static delivery entries")
+            print(f"Selected {overlay.entry_count} ets/static delivery entries")
             if self.dry_run:
                 return None
             environment = os.environ.copy()
@@ -908,6 +1011,8 @@ class StaticSdkBuilder:
             "arkdown_static_sdk",
             "--skip-partlist-check=true",
             "--load-test-config=false",
+            "--no-prebuilt-sdk=true",
+            "--deps-guard=false",
             "--gn-args",
             " ".join(gn_arguments),
         ]

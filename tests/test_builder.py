@@ -2,11 +2,13 @@ from __future__ import annotations
 
 import json
 import stat
+import subprocess
 import sys
 import tarfile
 import tempfile
 import unittest
 import zipfile
+import xml.etree.ElementTree as ElementTree
 from pathlib import Path
 from unittest.mock import patch
 
@@ -88,6 +90,8 @@ class StaticSdkOverlayTests(unittest.TestCase):
                 """from pathlib import Path
 import sys
 
+if sys.argv[1:] == ['list', '-a']:
+    raise SystemExit(0)
 assert sys.argv[1:3] == ['manifest', '-r']
 Path(sys.argv[4]).write_text('<manifest/>')
 """,
@@ -99,6 +103,80 @@ Path(sys.argv[4]).write_text('<manifest/>')
 
             self.assertTrue(written)
             self.assertEqual("<manifest/>", destination.read_text(encoding="utf-8"))
+
+    def test_writes_only_checked_out_projects_for_partial_source_tree(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            launcher = root / ".repo/repo/repo"
+            launcher.parent.mkdir(parents=True)
+            launcher.write_text(
+                """import sys
+
+assert sys.argv[1:] == ['list', '-a']
+print('arkcompiler/ets_frontend : arkcompiler_ets_frontend')
+print('applications/launcher : applications_launcher')
+""",
+                encoding="utf-8",
+            )
+            project = root / "arkcompiler/ets_frontend"
+            project.mkdir(parents=True)
+            subprocess.run(["git", "init", "-q", str(project)], check=True)
+            subprocess.run(
+                ["git", "-C", str(project), "config", "user.name", "Test"],
+                check=True,
+            )
+            subprocess.run(
+                ["git", "-C", str(project), "config", "user.email", "test@example.com"],
+                check=True,
+            )
+            (project / "source.txt").write_text("source", encoding="utf-8")
+            subprocess.run(["git", "-C", str(project), "add", "source.txt"], check=True)
+            subprocess.run(
+                ["git", "-C", str(project), "commit", "-q", "-m", "source"],
+                check=True,
+            )
+            subprocess.run(
+                [
+                    "git",
+                    "-C",
+                    str(project),
+                    "remote",
+                    "add",
+                    "gitcode",
+                    "https://gitcode.com/openharmony/arkcompiler_ets_frontend",
+                ],
+                check=True,
+            )
+            revision = subprocess.run(
+                ["git", "-C", str(project), "rev-parse", "HEAD"],
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout.strip()
+            destination = root / "dist/source.xml"
+
+            written = SourceTree(root).write_pinned_manifest(destination)
+
+            self.assertTrue(written)
+            manifest = ElementTree.parse(destination).getroot()
+            self.assertEqual(
+                [
+                    {
+                        "name": "arkcompiler_ets_frontend",
+                        "path": "arkcompiler/ets_frontend",
+                        "remote": "remote-0",
+                        "revision": revision,
+                    }
+                ],
+                [project.attrib for project in manifest.findall("project")],
+            )
+            self.assertEqual(
+                {
+                    "name": "remote-0",
+                    "fetch": "https://gitcode.com/openharmony",
+                },
+                manifest.find("remote").attrib,
+            )
 
     def test_filters_upstream_description_and_preserves_product_features(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
@@ -114,6 +192,18 @@ Path(sys.argv[4]).write_text('<manifest/>')
                 self.assertTrue(selected)
                 self.assertTrue(
                     all(item["install_dir"].startswith("ets/static/") for item in selected)
+                )
+                compat_entries = [
+                    item
+                    for item in selected
+                    if item["install_dir"].endswith(
+                        "libarkts/node_modules/@koalaui/compat/"
+                    )
+                ]
+                self.assertEqual(1, len(compat_entries))
+                self.assertEqual(
+                    "//vendor/arkdown/arkdown-static-sdk:libarkts_compat_runtime",
+                    compat_entries[0]["module_label"],
                 )
                 self.assertEqual("arkdown-static-sdk", product["product_name"])
                 self.assertEqual(
@@ -145,6 +235,10 @@ Path(sys.argv[4]).write_text('<manifest/>')
                 )
                 self.assertIn(
                     'group("arkdown_static_sdk")',
+                    overlay.product_build_path.read_text(encoding="utf-8"),
+                )
+                self.assertIn(
+                    'ohos_copy("libarkts_compat_runtime")',
                     overlay.product_build_path.read_text(encoding="utf-8"),
                 )
                 self.assertEqual(
@@ -213,6 +307,8 @@ Path(sys.argv[4]).write_text('<manifest/>')
         self.assertIn(PRODUCT_NAME, PRODUCT_SELECTOR)
         self.assertEqual("arkdown_static_sdk", command[5])
         self.assertIn("--load-test-config=false", command)
+        self.assertIn("--no-prebuilt-sdk=true", command)
+        self.assertIn("--deps-guard=false", command)
         self.assertIn("is_llvm_build=true", command[-1])
         self.assertIn("startup_init_with_param_base=true", command[-1])
         self.assertIn(
