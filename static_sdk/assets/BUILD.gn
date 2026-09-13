@@ -16,16 +16,38 @@ static_ets_modules = ohos_sdk_modules.ets
 
 # The current libarkts Rollup output intentionally retains
 # `require("@koalaui/compat")`, and libarkts/package.json declares the sibling
-# compat package as a runtime dependency. Stage exactly that package beside
-# libarkts so the SDK artifact preserves the source-defined Node resolution
-# contract.
-ohos_copy("libarkts_compat_runtime") {
+# compat package as a runtime dependency. A clean checkout has no compiled
+# compat/build directory, so compile the source-declared package after the
+# upstream libarkts npm graph has installed its dependencies, then stage it
+# beside libarkts.
+action("stage_libarkts_compat_runtime") {
   deps = [
     "//developtools/ace_ets2bundle/ets1.2/libarkts:compile(${host_toolchain})",
   ]
+  script = "stage_compat.py"
+  compat_source = "//developtools/ace_ets2bundle/ets1.2/compat"
+  inputs = [
+    "$compat_source/package.json",
+    "$compat_source/tsconfig.json",
+  ]
+  output_root = "$target_gen_dir/$target_name"
+  outputs = [
+    "$output_root/build",
+    "$output_root/package.json",
+  ]
+  args = [
+    "--source",
+    rebase_path(compat_source, root_build_dir),
+    "--output",
+    rebase_path(output_root, root_build_dir),
+  ]
+}
+
+ohos_copy("libarkts_compat_runtime") {
+  deps = [ ":stage_libarkts_compat_runtime" ]
   sources = [
-    "//developtools/ace_ets2bundle/ets1.2/compat/build",
-    "//developtools/ace_ets2bundle/ets1.2/compat/package.json",
+    "$target_gen_dir/stage_libarkts_compat_runtime/build",
+    "$target_gen_dir/stage_libarkts_compat_runtime/package.json",
   ]
   outputs = [ "$target_out_dir/$target_name/{{source_file_part}}" ]
   module_source_dir = target_out_dir + "/$target_name"

@@ -57,10 +57,12 @@ class SyncSourceTests(unittest.TestCase):
     def test_static_project_set_excludes_full_product_sources(self) -> None:
         projects = set(sync_source.ETS_STATIC_SOURCE_PROJECTS)
 
-        self.assertEqual(72, len(projects))
+        self.assertEqual(90, len(projects))
         self.assertIn("arkcompiler/ets_frontend", projects)
         self.assertIn("developtools/ace_ets2bundle", projects)
         self.assertIn("interface/sdk-js", projects)
+        self.assertIn("third_party/rust/crates/cxx", projects)
+        self.assertIn("third_party/rust/crates/quote", projects)
         self.assertNotIn("applications/standard/launcher", projects)
         self.assertNotIn("device/board/hisilicon", projects)
         self.assertNotIn("kernel/linux/linux-5.10", projects)

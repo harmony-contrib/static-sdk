@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import stat
 import subprocess
 import sys
@@ -14,6 +15,7 @@ from unittest.mock import patch
 
 from static_sdk.builder import (
     DarwinBuildCompatibility,
+    Node14PackageCompatibility,
     NOTICE_INSTALL_RELATIVE_PATH,
     PRODUCT_NAME,
     PRODUCT_SELECTOR,
@@ -80,7 +82,159 @@ class DarwinBuildCompatibilityTests(unittest.TestCase):
             )
 
 
+class Node14PackageCompatibilityTests(unittest.TestCase):
+    def test_uses_shell_cleanup_and_restores_upstream_packages(self) -> None:
+        with tempfile.TemporaryDirectory() as source_directory:
+            root = Path(source_directory)
+            originals = {}
+            for relative_path, (original, _) in (
+                Node14PackageCompatibility.PACKAGE_PATCHES.items()
+            ):
+                package = root / relative_path
+                package.parent.mkdir(parents=True, exist_ok=True)
+                source = f'{{\n  "scripts": {{\n    {original}\n  }}\n}}\n'
+                package.write_text(source, encoding="utf-8")
+                package.with_name("package-lock.json").write_bytes(b"upstream-lock\n")
+                originals[package] = source
+
+            with Node14PackageCompatibility(SourceTree(root)):
+                for relative_path, (original, replacement) in (
+                    Node14PackageCompatibility.PACKAGE_PATCHES.items()
+                ):
+                    package = root / relative_path
+                    patched = package.read_text(encoding="utf-8")
+                    self.assertNotIn(original, patched)
+                    self.assertIn(replacement, patched)
+                    package.with_name("package-lock.json").unlink()
+
+            for package, source in originals.items():
+                self.assertEqual(source, package.read_text(encoding="utf-8"))
+                self.assertEqual(
+                    b"upstream-lock\n",
+                    package.with_name("package-lock.json").read_bytes(),
+                )
+
+
 class StaticSdkOverlayTests(unittest.TestCase):
+    @patch("static_sdk.builder.subprocess.run")
+    def test_prepares_only_missing_ets_node_projects(self, run) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            node_bin = root / "prebuilts/build-tools/common/nodejs/current/bin"
+            node_bin.mkdir(parents=True)
+            for executable in ("node", "npm"):
+                (node_bin / executable).write_text("", encoding="utf-8")
+            projects = list(SourceTree.NODE_PROJECTS.items())
+            source = SourceTree(root)
+            for relative_path, markers in projects:
+                project = root / relative_path
+                project.mkdir(parents=True)
+                (project / "package.json").write_text("{}", encoding="utf-8")
+                for marker in markers:
+                    path = project / marker
+                    path.parent.mkdir(parents=True, exist_ok=True)
+                    path.write_text("", encoding="utf-8")
+                stamp = project / SourceTree.NODE_DEPENDENCY_STAMP
+                stamp.parent.mkdir(parents=True, exist_ok=True)
+                stamp.write_text(
+                    source._node_dependency_stamp(project), encoding="utf-8"
+                )
+            missing_project, missing_markers = projects[1]
+            (root / missing_project / missing_markers[0]).unlink()
+
+            def install(command, *, cwd, env, check):
+                self.assertEqual(str(node_bin.resolve() / "npm"), command[0])
+                self.assertEqual("install", command[1])
+                self.assertIn("--ignore-scripts", command)
+                self.assertIn("--package-lock=false", command)
+                self.assertEqual(
+                    str(node_bin.resolve()), env["PATH"].split(os.pathsep, 1)[0]
+                )
+                self.assertTrue(check)
+                for marker in missing_markers:
+                    path = Path(cwd) / marker
+                    path.parent.mkdir(parents=True, exist_ok=True)
+                    path.write_text("", encoding="utf-8")
+
+            run.side_effect = install
+
+            source.prepare_node_dependencies()
+
+            self.assertEqual(1, run.call_count)
+            self.assertEqual(
+                root.resolve() / missing_project, run.call_args.kwargs["cwd"]
+            )
+
+    @patch("static_sdk.builder.subprocess.run")
+    def test_uses_npm_ci_for_locked_ets_node_project(self, run) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            node_bin = root / "prebuilts/build-tools/common/nodejs/current/bin"
+            node_bin.mkdir(parents=True)
+            for executable in ("node", "npm"):
+                (node_bin / executable).write_text("", encoding="utf-8")
+            relative_path, markers = next(iter(SourceTree.NODE_PROJECTS.items()))
+            project = root / relative_path
+            project.mkdir(parents=True)
+            (project / "package.json").write_text("{}", encoding="utf-8")
+            (project / "package-lock.json").write_text("{}", encoding="utf-8")
+
+            def install(command, *, cwd, env, check):
+                for marker in markers:
+                    path = Path(cwd) / marker
+                    path.parent.mkdir(parents=True, exist_ok=True)
+                    path.write_text("", encoding="utf-8")
+
+            run.side_effect = install
+            with patch.object(
+                SourceTree, "NODE_PROJECTS", {relative_path: markers}
+            ):
+                SourceTree(root).prepare_node_dependencies()
+
+            command = run.call_args.args[0]
+            self.assertEqual("ci", command[1])
+            self.assertNotIn("--package-lock=false", command)
+
+    @patch("static_sdk.builder.subprocess.run")
+    def test_falls_back_for_inconsistent_lock_and_restores_it(self, run) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            node_bin = root / "prebuilts/build-tools/common/nodejs/current/bin"
+            node_bin.mkdir(parents=True)
+            for executable in ("node", "npm"):
+                (node_bin / executable).write_text("", encoding="utf-8")
+            relative_path, markers = next(iter(SourceTree.NODE_PROJECTS.items()))
+            project = root / relative_path
+            project.mkdir(parents=True)
+            (project / "package.json").write_text("{}", encoding="utf-8")
+            lockfile = project / "package-lock.json"
+            lockfile.write_bytes(b"upstream-lock\n")
+
+            def install(command, *, cwd, env, check):
+                if command[1] == "ci":
+                    partial = Path(cwd) / "node_modules/partial"
+                    partial.parent.mkdir(parents=True, exist_ok=True)
+                    partial.write_text("incomplete", encoding="utf-8")
+                    raise subprocess.CalledProcessError(1, command)
+                self.assertFalse((Path(cwd) / "node_modules/partial").exists())
+                lockfile.write_bytes(b"changed-lock\n")
+                for marker in markers:
+                    path = Path(cwd) / marker
+                    path.parent.mkdir(parents=True, exist_ok=True)
+                    path.write_text("", encoding="utf-8")
+
+            run.side_effect = install
+            with patch.object(
+                SourceTree, "NODE_PROJECTS", {relative_path: markers}
+            ):
+                SourceTree(root).prepare_node_dependencies()
+
+            self.assertEqual(
+                ["ci", "install"],
+                [call.args[0][1] for call in run.call_args_list],
+            )
+            self.assertEqual(b"upstream-lock\n", lockfile.read_bytes())
+
     def test_writes_manifest_with_current_python_interpreter(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
             root = Path(temporary_directory)
@@ -90,7 +244,7 @@ class StaticSdkOverlayTests(unittest.TestCase):
                 """from pathlib import Path
 import sys
 
-if sys.argv[1:] == ['list', '-a']:
+if sys.argv[1:] == ['list']:
     raise SystemExit(0)
 assert sys.argv[1:3] == ['manifest', '-r']
 Path(sys.argv[4]).write_text('<manifest/>')
@@ -112,7 +266,7 @@ Path(sys.argv[4]).write_text('<manifest/>')
             launcher.write_text(
                 """import sys
 
-assert sys.argv[1:] == ['list', '-a']
+assert sys.argv[1:] == ['list']
 print('arkcompiler/ets_frontend : arkcompiler_ets_frontend')
 print('applications/launcher : applications_launcher')
 """,
@@ -241,6 +395,11 @@ print('applications/launcher : applications_launcher')
                     'ohos_copy("libarkts_compat_runtime")',
                     overlay.product_build_path.read_text(encoding="utf-8"),
                 )
+                self.assertIn(
+                    'action("stage_libarkts_compat_runtime")',
+                    overlay.product_build_path.read_text(encoding="utf-8"),
+                )
+                self.assertTrue(overlay.product_compat_stage_path.is_file())
                 self.assertEqual(
                     [],
                     json.loads(
@@ -273,6 +432,7 @@ print('applications/launcher : applications_launcher')
                             component["prune_deps"]["sub_component"],
                         )
             self.assertFalse(overlay.description_path.exists())
+            self.assertFalse(overlay.product_compat_stage_path.exists())
             self.assertFalse(overlay.inner_kits_allowlist_path.exists())
             self.assertFalse(overlay.product_path.exists())
             self.assertFalse(overlay.product_bundle_path.exists())

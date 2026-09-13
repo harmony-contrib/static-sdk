@@ -16,9 +16,10 @@ DEFAULT_REVISION = "OpenHarmony-7.0-Release"
 # graph.  Keep this list explicit: invoking `repo sync` without project paths
 # checks out every project in the product manifest, including applications,
 # device products, kernels, and services that cannot contribute to the SDK
-# archive.  These 72 projects are the source/metadata closure used by the
-# successful Darwin arm64 build; direct GN/Ninja edges still decide which
-# targets inside them are compiled.
+# archive.  These 90 projects are the source/metadata closure used by the
+# Darwin arm64, Linux x64, and Windows x64 graphs; direct GN/Ninja edges still
+# decide which targets inside them are compiled.  The extra Rust crates compared
+# with the Darwin-only closure build Linux's source-declared cxxbridge host tool.
 ETS_STATIC_SOURCE_PROJECTS = (
     "arkcompiler/ets_frontend",
     "arkcompiler/ets_runtime",
@@ -85,8 +86,26 @@ ETS_STATIC_SOURCE_PROJECTS = (
     "third_party/openssl",
     "third_party/pcre2",
     "third_party/protobuf",
+    "third_party/rust/crates/bitflags",
+    "third_party/rust/crates/clap",
+    "third_party/rust/crates/codespan",
     "third_party/rust/crates/cxx",
+    "third_party/rust/crates/heck",
+    "third_party/rust/crates/io-lifetimes",
+    "third_party/rust/crates/is-terminal",
     "third_party/rust/crates/libc",
+    "third_party/rust/crates/linux-raw-sys",
+    "third_party/rust/crates/memchr",
+    "third_party/rust/crates/once_cell",
+    "third_party/rust/crates/os_str_bytes",
+    "third_party/rust/crates/proc-macro2",
+    "third_party/rust/crates/quote",
+    "third_party/rust/crates/rustix",
+    "third_party/rust/crates/strsim-rs",
+    "third_party/rust/crates/syn",
+    "third_party/rust/crates/termcolor",
+    "third_party/rust/crates/unicode-ident",
+    "third_party/rust/crates/unicode-width",
     "third_party/selinux",
     "third_party/typescript",
     "third_party/vixl",
